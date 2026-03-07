@@ -1,0 +1,30 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure Ghiseul.ro",
+        "description": "Enter your Ghiseul.ro account credentials",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Ghiseul.ro",
+        "description": "Authentication for account {username} failed. Please enter the correct password.",
+        "data": {
+          "password": "New password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to Ghiseul.ro",
+      "invalid_auth": "Invalid authentication credentials",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "Account is already configured",
+      "reauth_successful": "Reauthentication successful"
+    }
+  }
+}

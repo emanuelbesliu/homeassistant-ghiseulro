@@ -1,0 +1,30 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configurează Ghiseul.ro",
+        "description": "Introdu datele de autentificare pentru contul tău Ghiseul.ro",
+        "data": {
+          "username": "Nume utilizator",
+          "password": "Parolă"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reautentificare Ghiseul.ro",
+        "description": "Autentificarea pentru contul {username} a eșuat. Te rugăm să introduci parola corectă.",
+        "data": {
+          "password": "Parolă nouă"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Nu s-a putut conecta la Ghiseul.ro",
+      "invalid_auth": "Date de autentificare invalide",
+      "unknown": "Eroare neașteptată"
+    },
+    "abort": {
+      "already_configured": "Contul este deja configurat",
+      "reauth_successful": "Reautentificare reușită"
+    }
+  }
+}
