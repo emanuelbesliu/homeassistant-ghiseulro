@@ -22,7 +22,6 @@ import re
 from typing import Any
 
 import aiohttp
-from aiohttp import ClientSession
 
 from .const import (
     BASE_URL,
@@ -38,16 +37,43 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Browser-like User-Agent to avoid WAF/bot blocking
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
 
 class GhiseulRoAPI:
-    """API client for the Ghiseul.ro platform."""
+    """API client for the Ghiseul.ro platform.
 
-    def __init__(self, session: ClientSession, username: str, password: str) -> None:
+    Creates its own aiohttp.ClientSession with a CookieJar so session
+    cookies from ghiseul.ro (PHPSESSID) are stored and sent automatically.
+    The HA shared session disables cookies, which breaks cookie-based auth.
+    """
+
+    def __init__(self, username: str, password: str) -> None:
         """Initialize the API client."""
-        self._session = session
         self._username = username
         self._password = password
+        self._session: aiohttp.ClientSession | None = None
         self._authenticated = False
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create the dedicated aiohttp session with cookie support."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                cookie_jar=aiohttp.CookieJar(),
+                headers={"User-Agent": _USER_AGENT},
+            )
+        return self._session
+
+    async def async_close(self) -> None:
+        """Close the underlying aiohttp session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     async def authenticate(self) -> bool:
         """Authenticate with the Ghiseul.ro platform.
@@ -61,6 +87,8 @@ class GhiseulRoAPI:
         so we don't need to track cookies manually.
         """
         try:
+            session = await self._get_session()
+
             login_data = {
                 "username": self._username,
                 "password": self._password,
@@ -70,9 +98,11 @@ class GhiseulRoAPI:
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": f"{BASE_URL}/",
                 "Origin": "https://www.ghiseul.ro",
+                "Accept": "text/html, */*; q=0.01",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             }
 
-            async with self._session.post(
+            async with session.post(
                 LOGIN_URL,
                 data=login_data,
                 headers=headers,
@@ -86,7 +116,7 @@ class GhiseulRoAPI:
                 _LOGGER.debug("Login response body: %s", body[:200])
 
             # Verify we are logged in by checking the este-logat endpoint
-            async with self._session.post(
+            async with session.post(
                 IS_LOGGED_IN_URL,
                 headers={"X-Requested-With": "XMLHttpRequest"},
             ) as response:
@@ -191,11 +221,13 @@ class GhiseulRoAPI:
         }
 
         try:
+            session = await self._get_session()
+
             # Step 1: Load ANAF page to establish context and extract CUI
             headers = {
                 "Referer": DEBITE_URL,
             }
-            async with self._session.get(
+            async with session.get(
                 DEBITE_ANAF_URL,
                 headers=headers,
             ) as response:
@@ -227,7 +259,7 @@ class GhiseulRoAPI:
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": DEBITE_ANAF_URL,
             }
-            async with self._session.get(
+            async with session.get(
                 DEBITE_INCARCA_ANAF_URL,
                 headers=ajax_headers,
             ) as response:
@@ -405,13 +437,15 @@ class GhiseulRoAPI:
         institutions: dict[str, dict[str, Any]] = {}
 
         try:
+            session = await self._get_session()
+
             # Step 1: Get institution list
             ajax_headers = {
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": DEBITE_URL,
             }
 
-            async with self._session.get(
+            async with session.get(
                 DEBITE_INSTITUTII_URL,
                 headers=ajax_headers,
             ) as response:
@@ -543,7 +577,8 @@ class GhiseulRoAPI:
             "Referer": DEBITE_URL,
         }
 
-        async with self._session.get(url, headers=ajax_headers) as response:
+        session = await self._get_session()
+        async with session.get(url, headers=ajax_headers) as response:
             if response.status != 200:
                 raise Exception(
                     f"Failed to fetch institution {inst_id}: {response.status}"

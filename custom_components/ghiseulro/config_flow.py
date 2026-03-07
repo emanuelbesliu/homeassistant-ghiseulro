@@ -15,7 +15,6 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import GhiseulRoAPI
 from .const import DOMAIN
@@ -35,8 +34,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
     Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
     """
-    session = async_get_clientsession(hass)
-    api = GhiseulRoAPI(session, data[CONF_USERNAME], data[CONF_PASSWORD])
+    api = GhiseulRoAPI(data[CONF_USERNAME], data[CONF_PASSWORD])
 
     try:
         result = await api.authenticate()
@@ -47,6 +45,8 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     except Exception as err:
         _LOGGER.error("Failed to authenticate: %s", err)
         raise CannotConnect from err
+    finally:
+        await api.async_close()
 
     return {"title": f"Ghiseul.ro - {data[CONF_USERNAME]}"}
 
