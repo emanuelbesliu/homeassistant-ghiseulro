@@ -62,6 +62,7 @@ from .const import (
     ANAF_INSTITUTION_ID,
     DEFAULT_FLARESOLVERR_URL,
     FLARESOLVERR_MAX_TIMEOUT,
+    FLARESOLVERR_TABS_TILL_VERIFY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -304,7 +305,7 @@ class GhiseulRoAPI:
             resp = requests.post(
                 self._flaresolverr_url,
                 json=payload,
-                timeout=120,
+                timeout=180,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -375,6 +376,7 @@ class GhiseulRoAPI:
             "url": f"{BASE_URL}/",
             "session": self._flaresolverr_session_id,
             "maxTimeout": FLARESOLVERR_MAX_TIMEOUT,
+            "tabs_till_verify": FLARESOLVERR_TABS_TILL_VERIFY,
         })
 
         solution = data.get("solution", {})

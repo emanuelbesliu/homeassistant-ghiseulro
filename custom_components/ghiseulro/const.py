@@ -28,4 +28,11 @@ CONF_FLARESOLVERR_URL = "flaresolverr_url"
 DEFAULT_FLARESOLVERR_URL = "http://homeassistant:8191/v1"
 
 # FlareSolverr timeout for solving Cloudflare challenges (ms)
-FLARESOLVERR_MAX_TIMEOUT = 60000
+# Turnstile verification can take 30-60s, so allow 120s total
+FLARESOLVERR_MAX_TIMEOUT = 120000
+
+# Number of Tab key presses needed to reach the Turnstile "Verify you are
+# human" checkbox.  FlareSolverr simulates pressing Tab this many times,
+# then activates the focused element.  The correct value depends on the
+# page layout; ghiseul.ro typically needs 1.
+FLARESOLVERR_TABS_TILL_VERIFY = 1
