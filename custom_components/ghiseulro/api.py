@@ -62,12 +62,17 @@ class GhiseulRoAPI:
     def _get_scraper(self) -> cloudscraper.CloudScraper:
         """Get or create the cloudscraper session."""
         if self._scraper is None:
+            _LOGGER.debug("Creating new cloudscraper session")
             self._scraper = cloudscraper.create_scraper(
                 browser={
                     "browser": "chrome",
                     "platform": "windows",
                     "desktop": True,
                 },
+            )
+            _LOGGER.debug(
+                "Cloudscraper session created. User-Agent: %s",
+                self._scraper.headers.get("User-Agent", "N/A"),
             )
         return self._scraper
 
@@ -89,13 +94,49 @@ class GhiseulRoAPI:
         """Authenticate with the Ghiseul.ro platform.
 
         The authentication flow:
-        1. POST /login/process with username and password
-        2. Server sets session cookie automatically
+        1. GET the base page first to obtain WAF clearance cookies
+        2. POST /login/process with username and password
         3. Verify session by checking /index/este-logat
         """
         try:
             scraper = self._get_scraper()
 
+            # Step 0: Hit the base URL first to solve any WAF challenge
+            # and obtain clearance cookies before attempting login
+            _LOGGER.debug(
+                "Step 0: Fetching base URL to solve WAF challenge: %s",
+                BASE_URL,
+            )
+            response = scraper.get(f"{BASE_URL}/")
+            _LOGGER.debug(
+                "Step 0 result: status=%s, url=%s, body_length=%d",
+                response.status_code,
+                response.url,
+                len(response.text),
+            )
+            _LOGGER.debug(
+                "Step 0 response headers: %s",
+                dict(response.headers),
+            )
+            _LOGGER.debug(
+                "Step 0 cookies after base page: %s",
+                {k: v for k, v in scraper.cookies.get_dict().items()},
+            )
+            # Check if WAF challenge page was returned instead of real content
+            if "security verification" in response.text.lower() or response.status_code == 403:
+                _LOGGER.warning(
+                    "Step 0: WAF challenge page detected (status=%s). "
+                    "Body snippet: %.500s",
+                    response.status_code,
+                    response.text[:500],
+                )
+            else:
+                _LOGGER.debug(
+                    "Step 0: Base page loaded OK. Body snippet: %.300s",
+                    response.text[:300],
+                )
+
+            # Step 1: POST login
             login_data = {
                 "username": self._username,
                 "password": self._password,
@@ -109,24 +150,53 @@ class GhiseulRoAPI:
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             }
 
+            _LOGGER.debug("Step 1: Posting login to %s", LOGIN_URL)
             response = scraper.post(
                 LOGIN_URL,
                 data=login_data,
                 headers=headers,
             )
+            _LOGGER.debug(
+                "Step 1 result: status=%s, url=%s, body_length=%d",
+                response.status_code,
+                response.url,
+                len(response.text),
+            )
+            _LOGGER.debug(
+                "Step 1 response headers: %s",
+                dict(response.headers),
+            )
+            _LOGGER.debug(
+                "Step 1 cookies: %s",
+                {k: v for k, v in scraper.cookies.get_dict().items()},
+            )
+
             if response.status_code != 200:
                 _LOGGER.error(
-                    "Login request failed with status: %s", response.status_code
+                    "Login request failed with status: %s. "
+                    "Response headers: %s. Body snippet: %.500s",
+                    response.status_code,
+                    dict(response.headers),
+                    response.text[:500],
                 )
                 return False
 
-            _LOGGER.debug("Login response body: %s", response.text[:200])
+            _LOGGER.debug(
+                "Step 1 login response body: %.300s", response.text[:300]
+            )
 
-            # Verify we are logged in by checking the este-logat endpoint
+            # Step 2: Verify we are logged in
+            _LOGGER.debug("Step 2: Verifying login via %s", IS_LOGGED_IN_URL)
             response = scraper.post(
                 IS_LOGGED_IN_URL,
                 headers={"X-Requested-With": "XMLHttpRequest"},
             )
+            _LOGGER.debug(
+                "Step 2 result: status=%s, body='%s'",
+                response.status_code,
+                response.text[:100].strip(),
+            )
+
             if response.status_code == 200:
                 body = response.text.strip()
                 if body == "1":
@@ -141,13 +211,22 @@ class GhiseulRoAPI:
                     return False
             else:
                 _LOGGER.error(
-                    "Login verification failed with status: %s",
+                    "Login verification failed with status: %s. "
+                    "Body: %.300s",
                     response.status_code,
+                    response.text[:300],
                 )
                 return False
 
+        except cloudscraper.exceptions.CloudflareChallengeError as err:
+            _LOGGER.error(
+                "Cloudscraper failed to solve WAF challenge: %s", err
+            )
+            raise
         except Exception as err:
-            _LOGGER.error("Authentication error: %s", err)
+            _LOGGER.error(
+                "Authentication error (%s): %s", type(err).__name__, err
+            )
             raise
 
     # ------------------------------------------------------------------
