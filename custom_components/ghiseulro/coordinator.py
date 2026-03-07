@@ -159,13 +159,13 @@ class GhiseulRoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Checks for:
         - HTTP 401 / 403 status codes in the message
         - Explicit "login" / "authentication" phrases
-        - aiohttp ClientResponseError with matching status
+        - requests.HTTPError with matching status code
         """
-        import aiohttp
+        import requests
 
-        # aiohttp gives us a typed status code
-        if isinstance(err, aiohttp.ClientResponseError):
-            if err.status in (401, 403):
+        # requests/cloudscraper gives us HTTPError with a response
+        if isinstance(err, requests.HTTPError) and err.response is not None:
+            if err.response.status_code in (401, 403):
                 return True
 
         # Fall back to inspecting the string representation

@@ -9,19 +9,25 @@ Ghiseul.ro or the Romanian Government.
 
 The API flow:
 1. POST /login/process with username+password (AJAX, x-www-form-urlencoded)
-   - Session cookie is set automatically by aiohttp CookieJar
+   - Session cookie is managed automatically by cloudscraper
 2. GET /debite/institutii (AJAX) -> HTML fragment listing enrolled institutions
 3. GET /debite/get-institution-details/id_inst/{id} (AJAX) -> institution debt details
 4. GET /debite/anaf -> full page with ANAF section (contains CUI, tipPers, id_inst)
 5. GET /debite/incarca-debite-anaf (AJAX) -> HTML fragment with ANAF obligations
+
+Uses cloudscraper to bypass Cloudflare/WAF bot-protection challenges.
+cloudscraper is synchronous (requests-based), so all HTTP calls are
+dispatched to an executor via asyncio.to_thread() to avoid blocking
+the Home Assistant event loop.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
 
-import aiohttp
+import cloudscraper
 
 from .const import (
     BASE_URL,
@@ -37,57 +43,58 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Browser-like User-Agent to avoid WAF/bot blocking
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
-
 
 class GhiseulRoAPI:
     """API client for the Ghiseul.ro platform.
 
-    Creates its own aiohttp.ClientSession with a CookieJar so session
-    cookies from ghiseul.ro (PHPSESSID) are stored and sent automatically.
-    The HA shared session disables cookies, which breaks cookie-based auth.
+    Uses cloudscraper (a requests.Session subclass) to handle WAF
+    bot-protection challenges automatically.  All HTTP calls run in
+    a thread-pool executor so the HA event loop is never blocked.
     """
 
     def __init__(self, username: str, password: str) -> None:
         """Initialize the API client."""
         self._username = username
         self._password = password
-        self._session: aiohttp.ClientSession | None = None
+        self._scraper: cloudscraper.CloudScraper | None = None
         self._authenticated = False
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create the dedicated aiohttp session with cookie support."""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                cookie_jar=aiohttp.CookieJar(),
-                headers={"User-Agent": _USER_AGENT},
+    def _get_scraper(self) -> cloudscraper.CloudScraper:
+        """Get or create the cloudscraper session."""
+        if self._scraper is None:
+            self._scraper = cloudscraper.create_scraper(
+                browser={
+                    "browser": "chrome",
+                    "platform": "windows",
+                    "desktop": True,
+                },
             )
-        return self._session
+        return self._scraper
 
     async def async_close(self) -> None:
-        """Close the underlying aiohttp session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        """Close the underlying requests session."""
+        if self._scraper is not None:
+            self._scraper.close()
+            self._scraper = None
+
+    # ------------------------------------------------------------------
+    # Authentication
+    # ------------------------------------------------------------------
 
     async def authenticate(self) -> bool:
+        """Authenticate with the Ghiseul.ro platform (async wrapper)."""
+        return await asyncio.to_thread(self._authenticate_sync)
+
+    def _authenticate_sync(self) -> bool:
         """Authenticate with the Ghiseul.ro platform.
 
         The authentication flow:
         1. POST /login/process with username and password
         2. Server sets session cookie automatically
         3. Verify session by checking /index/este-logat
-
-        The aiohttp session manages cookies automatically via its CookieJar,
-        so we don't need to track cookies manually.
         """
         try:
-            session = await self._get_session()
+            scraper = self._get_scraper()
 
             login_data = {
                 "username": self._username,
@@ -102,46 +109,50 @@ class GhiseulRoAPI:
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             }
 
-            async with session.post(
+            response = scraper.post(
                 LOGIN_URL,
                 data=login_data,
                 headers=headers,
-            ) as response:
-                if response.status != 200:
-                    _LOGGER.error("Login request failed with status: %s", response.status)
-                    return False
+            )
+            if response.status_code != 200:
+                _LOGGER.error(
+                    "Login request failed with status: %s", response.status_code
+                )
+                return False
 
-                # The login endpoint returns a small HTML response
-                body = await response.text()
-                _LOGGER.debug("Login response body: %s", body[:200])
+            _LOGGER.debug("Login response body: %s", response.text[:200])
 
             # Verify we are logged in by checking the este-logat endpoint
-            async with session.post(
+            response = scraper.post(
                 IS_LOGGED_IN_URL,
                 headers={"X-Requested-With": "XMLHttpRequest"},
-            ) as response:
-                if response.status == 200:
-                    body = await response.text()
-                    body = body.strip()
-                    if body == "1":
-                        self._authenticated = True
-                        _LOGGER.info("Successfully authenticated with Ghiseul.ro")
-                        return True
-                    else:
-                        _LOGGER.error(
-                            "Login verification failed: este-logat returned '%s'",
-                            body[:50],
-                        )
-                        return False
+            )
+            if response.status_code == 200:
+                body = response.text.strip()
+                if body == "1":
+                    self._authenticated = True
+                    _LOGGER.info("Successfully authenticated with Ghiseul.ro")
+                    return True
                 else:
                     _LOGGER.error(
-                        "Login verification failed with status: %s", response.status
+                        "Login verification failed: este-logat returned '%s'",
+                        body[:50],
                     )
                     return False
+            else:
+                _LOGGER.error(
+                    "Login verification failed with status: %s",
+                    response.status_code,
+                )
+                return False
 
         except Exception as err:
             _LOGGER.error("Authentication error: %s", err)
             raise
+
+    # ------------------------------------------------------------------
+    # Data fetching
+    # ------------------------------------------------------------------
 
     async def get_data(self) -> dict[str, Any]:
         """Fetch all data: ANAF obligations and institution debts.
@@ -155,7 +166,6 @@ class GhiseulRoAPI:
                     {
                         "name": str,
                         "amount": float,
-                        "details": str,
                     }
                 ],
                 "cui": str,
@@ -185,8 +195,12 @@ class GhiseulRoAPI:
         if not self._authenticated:
             await self.authenticate()
 
-        anaf_data = await self._fetch_anaf_obligations()
-        institutions_data = await self._fetch_institution_debts()
+        return await asyncio.to_thread(self._get_data_sync)
+
+    def _get_data_sync(self) -> dict[str, Any]:
+        """Fetch all data synchronously (runs in executor thread)."""
+        anaf_data = self._fetch_anaf_obligations_sync()
+        institutions_data = self._fetch_institution_debts_sync()
 
         # Build summary
         anaf_total = anaf_data.get("total", 0.0)
@@ -205,7 +219,11 @@ class GhiseulRoAPI:
             },
         }
 
-    async def _fetch_anaf_obligations(self) -> dict[str, Any]:
+    # ------------------------------------------------------------------
+    # ANAF obligations
+    # ------------------------------------------------------------------
+
+    def _fetch_anaf_obligations_sync(self) -> dict[str, Any]:
         """Fetch ANAF tax obligations.
 
         First loads /debite/anaf to get the ANAF page context (CUI, tipPers),
@@ -221,60 +239,60 @@ class GhiseulRoAPI:
         }
 
         try:
-            session = await self._get_session()
+            scraper = self._get_scraper()
 
             # Step 1: Load ANAF page to establish context and extract CUI
-            headers = {
-                "Referer": DEBITE_URL,
-            }
-            async with session.get(
+            response = scraper.get(
                 DEBITE_ANAF_URL,
-                headers=headers,
-            ) as response:
-                if response.status != 200:
-                    _LOGGER.error(
-                        "Failed to load ANAF page: %s", response.status
-                    )
-                    raise Exception(f"Failed to load ANAF page: {response.status}")
-
-                html = await response.text()
-
-                # Extract CUI from hidden input
-                cui_match = re.search(
-                    r'name="cui_plata"\s+value="(\d+)"', html
+                headers={"Referer": DEBITE_URL},
+            )
+            if response.status_code != 200:
+                _LOGGER.error(
+                    "Failed to load ANAF page: %s", response.status_code
                 )
-                if cui_match:
-                    result["cui"] = cui_match.group(1)
-                    _LOGGER.debug("Found CUI: %s", result["cui"])
-
-                # Extract tipPers
-                tip_match = re.search(
-                    r'name="tipPers"\s+value="(\d+)"', html
+                raise Exception(
+                    f"Failed to load ANAF page: {response.status_code}"
                 )
-                if tip_match:
-                    result["tip_pers"] = tip_match.group(1)
+
+            html = response.text
+
+            # Extract CUI from hidden input
+            cui_match = re.search(
+                r'name="cui_plata"\s+value="(\d+)"', html
+            )
+            if cui_match:
+                result["cui"] = cui_match.group(1)
+                _LOGGER.debug("Found CUI in ANAF page")
+
+            # Extract tipPers
+            tip_match = re.search(
+                r'name="tipPers"\s+value="(\d+)"', html
+            )
+            if tip_match:
+                result["tip_pers"] = tip_match.group(1)
 
             # Step 2: Load actual ANAF obligations via AJAX
             ajax_headers = {
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": DEBITE_ANAF_URL,
             }
-            async with session.get(
+            response = scraper.get(
                 DEBITE_INCARCA_ANAF_URL,
                 headers=ajax_headers,
-            ) as response:
-                if response.status != 200:
-                    _LOGGER.error(
-                        "Failed to load ANAF obligations: %s", response.status
-                    )
-                    raise Exception(
-                        f"Failed to load ANAF obligations: {response.status}"
-                    )
+            )
+            if response.status_code != 200:
+                _LOGGER.error(
+                    "Failed to load ANAF obligations: %s",
+                    response.status_code,
+                )
+                raise Exception(
+                    f"Failed to load ANAF obligations: {response.status_code}"
+                )
 
-                html = await response.text()
-                _LOGGER.debug("ANAF obligations HTML length: %d", len(html))
+            html = response.text
+            _LOGGER.debug("ANAF obligations HTML length: %d", len(html))
 
-                result.update(self._parse_anaf_obligations(html))
+            result.update(self._parse_anaf_obligations(html))
 
         except Exception as err:
             _LOGGER.error("Error fetching ANAF obligations: %s", err)
@@ -286,7 +304,7 @@ class GhiseulRoAPI:
         """Parse the ANAF obligations HTML fragment.
 
         The response can be:
-        1. "Nu există obligații de plată" - no debts
+        1. "Nu exista obligatii de plata" - no debts
         2. HTML table with obligation rows containing:
            - Income type (tip venit)
            - Amount (suma)
@@ -307,13 +325,17 @@ class GhiseulRoAPI:
         }
 
         # Check for "no obligations" message
-        if "Nu există obligații de plată" in html or "nu exista obligatii" in html.lower():
+        if (
+            "Nu există obligații de plată" in html
+            or "nu exista obligatii" in html.lower()
+        ):
             parsed["message"] = "Nu există obligații de plată"
             return parsed
 
         # Check for error/info messages
         alert_match = re.search(
-            r'<div\s+class=["\']alert\s+alert-(?:warning|danger|info)["\']>(.*?)</div>',
+            r'<div\s+class=["\']alert\s+alert-(?:warning|danger|info)["\']>'
+            r"(.*?)</div>",
             html,
             re.DOTALL,
         )
@@ -322,13 +344,9 @@ class GhiseulRoAPI:
             parsed["message"] = msg
 
         # Try to parse obligation rows
-        # Pattern: rows with suma_venit_{id} containing amounts
-        # and corresponding labels
         obligations = []
 
         # Look for income type rows with amounts
-        # The pattern in the JS shows: suma_venit_{id} contains the amount
-        # and there are text labels for each income type
         amount_matches = re.findall(
             r"id=['\"]suma_venit_(\d+)['\"][^>]*>([\d.,]+)</",
             html,
@@ -341,22 +359,22 @@ class GhiseulRoAPI:
                 amount = self._parse_amount(amount_str)
 
                 # Try to find the label for this income type
-                # Labels are typically in a preceding element or parent row
                 name = f"Obligație fiscală {venit_id}"
 
                 # Look for label near this venit_id
                 label_pattern = (
-                    rf'showDetaliiVenit\([^,]*,\s*\d+\s*,\s*{venit_id}\s*\)'
-                    rf'[^>]*>([^<]+)<'
+                    rf"showDetaliiVenit\([^,]*,\s*\d+\s*,\s*{venit_id}\s*\)"
+                    rf"[^>]*>([^<]+)<"
                 )
                 label_match = re.search(label_pattern, html)
                 if label_match:
                     name = label_match.group(1).strip()
                 else:
-                    # Try broader pattern - look for text near suma_venit_{id}
+                    # Try broader pattern
                     broader_pattern = (
-                        rf'<tr[^>]*>.*?(?:showDetaliiVenit|venit)[^>]*{venit_id}[^>]*>'
-                        rf'.*?<td[^>]*>([^<]+)</td>'
+                        rf"<tr[^>]*>.*?(?:showDetaliiVenit|venit)"
+                        rf"[^>]*{venit_id}[^>]*>"
+                        rf".*?<td[^>]*>([^<]+)</td>"
                     )
                     broader_match = re.search(
                         broader_pattern, html, re.DOTALL
@@ -427,7 +445,11 @@ class GhiseulRoAPI:
         parsed["obligations"] = obligations
         return parsed
 
-    async def _fetch_institution_debts(self) -> dict[str, dict[str, Any]]:
+    # ------------------------------------------------------------------
+    # Institution debts
+    # ------------------------------------------------------------------
+
+    def _fetch_institution_debts_sync(self) -> dict[str, dict[str, Any]]:
         """Fetch debts from enrolled institutions (non-ANAF).
 
         Calls /debite/institutii to get the list of institutions,
@@ -437,7 +459,7 @@ class GhiseulRoAPI:
         institutions: dict[str, dict[str, Any]] = {}
 
         try:
-            session = await self._get_session()
+            scraper = self._get_scraper()
 
             # Step 1: Get institution list
             ajax_headers = {
@@ -445,21 +467,21 @@ class GhiseulRoAPI:
                 "Referer": DEBITE_URL,
             }
 
-            async with session.get(
+            response = scraper.get(
                 DEBITE_INSTITUTII_URL,
                 headers=ajax_headers,
-            ) as response:
-                if response.status != 200:
-                    _LOGGER.error(
-                        "Failed to load institutions: %s", response.status
-                    )
-                    return institutions
+            )
+            if response.status_code != 200:
+                _LOGGER.error(
+                    "Failed to load institutions: %s", response.status_code
+                )
+                return institutions
 
-                html = await response.text()
-                _LOGGER.debug("Institutions HTML length: %d", len(html))
+            html = response.text
+            _LOGGER.debug("Institutions HTML length: %d", len(html))
 
-                # Parse institution IDs and names from HTML
-                inst_list = self._parse_institution_list(html)
+            # Parse institution IDs and names from HTML
+            inst_list = self._parse_institution_list(html)
 
             # Step 2: Get details for each institution
             for inst_id, inst_name in inst_list:
@@ -468,7 +490,7 @@ class GhiseulRoAPI:
                     continue
 
                 try:
-                    details = await self._fetch_single_institution(inst_id)
+                    details = self._fetch_single_institution_sync(inst_id)
                     institutions[inst_id] = {
                         "name": inst_name,
                         **details,
@@ -506,12 +528,11 @@ class GhiseulRoAPI:
         institutions = []
 
         # Pattern 1: Panel with id attribute and heading text
-        # <div class="panel..." id="1234">
-        #   <div class="panel-heading">Institution Name</div>
         panel_pattern = re.findall(
-            r'<div[^>]*class=["\'][^"\']*panel[^"\']*["\'][^>]*id=["\'](\d+)["\']'
-            r'[^>]*>.*?<div[^>]*class=["\'][^"\']*panel-heading[^"\']*["\'][^>]*>'
-            r'(.*?)(?:</div>|<a)',
+            r'<div[^>]*class=["\'][^"\']*panel[^"\']*["\'][^>]*'
+            r'id=["\'](\d+)["\']'
+            r'[^>]*>.*?<div[^>]*class=["\'][^"\']*panel-heading'
+            r'[^"\']*["\'][^>]*>(.*?)(?:</div>|<a)',
             html,
             re.DOTALL,
         )
@@ -525,7 +546,7 @@ class GhiseulRoAPI:
 
         # Pattern 2: Links with institution IDs
         link_pattern = re.findall(
-            r'id_inst[/=](\d+).*?>(.*?)<',
+            r"id_inst[/=](\d+).*?>(.*?)<",
             html,
             re.DOTALL,
         )
@@ -539,8 +560,8 @@ class GhiseulRoAPI:
 
         # Pattern 3: Look for data attributes or onclick handlers
         onclick_pattern = re.findall(
-            r'(?:showDetalii|getInstitution|id_inst)[^(]*\((\d+)\)'
-            r'.*?>(.*?)<',
+            r"(?:showDetalii|getInstitution|id_inst)[^(]*\((\d+)\)"
+            r".*?>(.*?)<",
             html,
             re.DOTALL,
         )
@@ -550,7 +571,7 @@ class GhiseulRoAPI:
                 institutions.append((inst_id, name))
 
         # Deduplicate
-        seen = set()
+        seen: set[str] = set()
         unique = []
         for inst_id, name in institutions:
             if inst_id not in seen:
@@ -559,7 +580,7 @@ class GhiseulRoAPI:
 
         return unique
 
-    async def _fetch_single_institution(
+    def _fetch_single_institution_sync(
         self, inst_id: str
     ) -> dict[str, Any]:
         """Fetch debt details for a single institution.
@@ -571,21 +592,20 @@ class GhiseulRoAPI:
             "debts": [{"name": str, "amount": float}],
         }
         """
+        scraper = self._get_scraper()
         url = DEBITE_INSTITUTION_DETAILS_URL.format(id_inst=inst_id)
         ajax_headers = {
             "X-Requested-With": "XMLHttpRequest",
             "Referer": DEBITE_URL,
         }
 
-        session = await self._get_session()
-        async with session.get(url, headers=ajax_headers) as response:
-            if response.status != 200:
-                raise Exception(
-                    f"Failed to fetch institution {inst_id}: {response.status}"
-                )
+        response = scraper.get(url, headers=ajax_headers)
+        if response.status_code != 200:
+            raise Exception(
+                f"Failed to fetch institution {inst_id}: {response.status_code}"
+            )
 
-            html = await response.text()
-            return self._parse_institution_details(html)
+        return self._parse_institution_details(response.text)
 
     def _parse_institution_details(self, html: str) -> dict[str, Any]:
         """Parse institution debt details HTML.
@@ -627,14 +647,16 @@ class GhiseulRoAPI:
 
                 # Try to find label
                 label_match = re.search(
-                    rf'showDetaliiVenit\([^,]*,\s*\d+\s*,\s*{venit_id}\s*\)'
-                    rf'[^>]*>([^<]+)<',
+                    rf"showDetaliiVenit\([^,]*,\s*\d+\s*,\s*{venit_id}\s*\)"
+                    rf"[^>]*>([^<]+)<",
                     html,
                 )
                 if label_match:
                     name = label_match.group(1).strip()
 
-                debts.append({"id": venit_id, "name": name, "amount": amount})
+                debts.append(
+                    {"id": venit_id, "name": name, "amount": amount}
+                )
                 result["total"] += amount
 
         # Check TotalGeneral
@@ -659,7 +681,8 @@ class GhiseulRoAPI:
         # Look for table rows with amounts as fallback
         if not debts:
             row_pattern = re.findall(
-                r'<tr[^>]*>.*?<td[^>]*>([^<]+)</td>.*?<td[^>]*>([\d.,]+)\s*(?:RON|lei)?</td>',
+                r"<tr[^>]*>.*?<td[^>]*>([^<]+)</td>.*?<td[^>]*>"
+                r"([\d.,]+)\s*(?:RON|lei)?</td>",
                 html,
                 re.DOTALL | re.IGNORECASE,
             )
@@ -673,6 +696,10 @@ class GhiseulRoAPI:
 
         result["debts"] = debts
         return result
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _parse_amount(amount_str: str) -> float:

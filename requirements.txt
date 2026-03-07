@@ -1,5 +1,5 @@
 # Ghiseul.ro Home Assistant Integration Dependencies
 # These dependencies must be kept in sync with manifest.json
 
-# HTTP client for async API communication
-aiohttp>=3.8.0
+# HTTP client with WAF/bot-protection bypass
+cloudscraper>=1.2.71
