@@ -3,10 +3,11 @@
     "step": {
       "user": {
         "title": "Configure Ghiseul.ro",
-        "description": "Enter your Ghiseul.ro account credentials",
+        "description": "Enter your Ghiseul.ro account credentials.\n\nThis integration requires the FlareSolverr add-on to be installed and running to bypass Cloudflare protection on ghiseul.ro.",
         "data": {
           "username": "Username",
-          "password": "Password"
+          "password": "Password",
+          "flaresolverr_url": "FlareSolverr URL"
         }
       },
       "reauth_confirm": {
@@ -20,6 +21,7 @@
     "error": {
       "cannot_connect": "Could not connect to Ghiseul.ro",
       "invalid_auth": "Invalid authentication credentials",
+      "flaresolverr_unavailable": "FlareSolverr is not reachable. Make sure the FlareSolverr add-on is installed and running.",
       "unknown": "Unexpected error"
     },
     "abort": {

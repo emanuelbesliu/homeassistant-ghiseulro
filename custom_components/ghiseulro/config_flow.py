@@ -17,7 +17,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
 
 from .api import GhiseulRoAPI
-from .const import DOMAIN
+from .const import CONF_FLARESOLVERR_URL, DEFAULT_FLARESOLVERR_URL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +25,9 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_USERNAME): str,
         vol.Required(CONF_PASSWORD): str,
+        vol.Optional(
+            CONF_FLARESOLVERR_URL, default=DEFAULT_FLARESOLVERR_URL
+        ): str,
     }
 )
 
@@ -34,12 +37,26 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
     Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
     """
-    api = GhiseulRoAPI(data[CONF_USERNAME], data[CONF_PASSWORD])
+    flaresolverr_url = data.get(CONF_FLARESOLVERR_URL, DEFAULT_FLARESOLVERR_URL)
+
+    api = GhiseulRoAPI(
+        data[CONF_USERNAME],
+        data[CONF_PASSWORD],
+        flaresolverr_url=flaresolverr_url,
+    )
 
     try:
+        # First verify FlareSolverr is reachable
+        flaresolverr_ok = await api.async_test_flaresolverr()
+        if not flaresolverr_ok:
+            raise FlareSolverrUnavailable
+
+        # Then verify credentials by authenticating
         result = await api.authenticate()
         if not result:
             raise InvalidAuth
+    except FlareSolverrUnavailable:
+        raise
     except InvalidAuth:
         raise
     except Exception as err:
@@ -65,6 +82,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 info = await validate_input(self.hass, user_input)
+            except FlareSolverrUnavailable:
+                errors["base"] = "flaresolverr_unavailable"
             except CannotConnect:
                 errors["base"] = "cannot_connect"
             except InvalidAuth:
@@ -92,15 +111,20 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            # Get the existing entry to preserve the username
+            # Get the existing entry to preserve the username and FlareSolverr URL
             reauth_entry = self._get_reauth_entry()
             combined_data = {
                 CONF_USERNAME: reauth_entry.data[CONF_USERNAME],
                 CONF_PASSWORD: user_input[CONF_PASSWORD],
+                CONF_FLARESOLVERR_URL: reauth_entry.data.get(
+                    CONF_FLARESOLVERR_URL, DEFAULT_FLARESOLVERR_URL
+                ),
             }
 
             try:
                 await validate_input(self.hass, combined_data)
+            except FlareSolverrUnavailable:
+                errors["base"] = "flaresolverr_unavailable"
             except CannotConnect:
                 errors["base"] = "cannot_connect"
             except InvalidAuth:
@@ -134,3 +158,7 @@ class CannotConnect(HomeAssistantError):
 
 class InvalidAuth(HomeAssistantError):
     """Error to indicate there is invalid auth."""
+
+
+class FlareSolverrUnavailable(HomeAssistantError):
+    """Error to indicate FlareSolverr is not reachable."""

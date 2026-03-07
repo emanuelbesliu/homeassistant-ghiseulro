@@ -27,7 +27,7 @@ from homeassistant.helpers.update_coordinator import (
     UpdateFailed,
 )
 
-from .api import GhiseulRoAPI
+from .api import CloudflareChallengeDetected, FlareSolverrError, GhiseulRoAPI
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -157,24 +157,29 @@ class GhiseulRoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Determine whether an exception indicates an authentication problem.
 
         Checks for:
-        - HTTP 401 / 403 status codes in the message
+        - HTTP 401 / 403 status codes in requests.HTTPError
         - Explicit "login" / "authentication" phrases
-        - requests.HTTPError with matching status code
-        """
-        import requests
+        - NOT FlareSolverr or Cloudflare errors (those are transient, not auth)
 
-        # requests/cloudscraper gives us HTTPError with a response
-        if isinstance(err, requests.HTTPError) and err.response is not None:
+        FlareSolverrError and CloudflareChallengeDetected are infrastructure
+        issues (FlareSolverr down, challenge unsolvable), not credential
+        failures, so they are treated as transient errors and retried.
+        """
+        import requests as req_lib
+
+        # FlareSolverr / Cloudflare issues are NOT auth errors
+        if isinstance(err, (FlareSolverrError, CloudflareChallengeDetected)):
+            return False
+
+        # requests gives us HTTPError with a response
+        if isinstance(err, req_lib.HTTPError) and err.response is not None:
             if err.response.status_code in (401, 403):
                 return True
 
         # Fall back to inspecting the string representation
         err_str = str(err).lower()
         auth_keywords = (
-            "401",
-            "403",
             "unauthorized",
-            "forbidden",
             "authentication failed",
             "invalid credentials",
             "login failed",

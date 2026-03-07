@@ -7,18 +7,39 @@ This integration was developed through reverse engineering of the
 ghiseul.ro platform and is not affiliated with or endorsed by
 Ghiseul.ro or the Romanian Government.
 
+Architecture overview:
+  Phase 1 - Cloudflare bypass via FlareSolverr:
+    FlareSolverr (headless Firefox) navigates to the ghiseul.ro base URL,
+    solves the Cloudflare Managed Challenge (Turnstile), and returns
+    clearance cookies + the User-Agent string it used.
+
+  Phase 2 - Data fetching via requests.Session:
+    A plain requests.Session is configured with the clearance cookies and
+    the exact same User-Agent.  All subsequent HTTP calls (login, ANAF
+    obligations, institution debts) go through this session.
+
+    CRITICAL: The User-Agent MUST match the one FlareSolverr used.
+    If they don't match, Cloudflare will re-issue the challenge.
+
+  Cookie refresh:
+    Cloudflare clearance cookies expire (typically 15-30 minutes).
+    Every HTTP request is wrapped by _request_with_clearance() which
+    detects 403 / "Just a moment..." challenge pages.  On detection it:
+      1. Re-solves the challenge via FlareSolverr
+      2. Re-authenticates with ghiseul.ro (session is lost on new clearance)
+      3. Retries the original request once
+    At most one re-solve per request to prevent infinite loops.
+
 The API flow:
 1. POST /login/process with username+password (AJAX, x-www-form-urlencoded)
-   - Session cookie is managed automatically by cloudscraper
+   - Session cookie is managed automatically by requests.Session
 2. GET /debite/institutii (AJAX) -> HTML fragment listing enrolled institutions
-3. GET /debite/get-institution-details/id_inst/{id} (AJAX) -> institution debt details
-4. GET /debite/anaf -> full page with ANAF section (contains CUI, tipPers, id_inst)
+3. GET /debite/get-institution-details/id_inst/{id} -> institution debt details
+4. GET /debite/anaf -> full page with ANAF section (contains CUI, tipPers)
 5. GET /debite/incarca-debite-anaf (AJAX) -> HTML fragment with ANAF obligations
 
-Uses cloudscraper to bypass Cloudflare/WAF bot-protection challenges.
-cloudscraper is synchronous (requests-based), so all HTTP calls are
-dispatched to an executor via asyncio.to_thread() to avoid blocking
-the Home Assistant event loop.
+All HTTP calls are synchronous (requests-based) and dispatched to an
+executor via asyncio.to_thread() to avoid blocking the HA event loop.
 """
 from __future__ import annotations
 
@@ -27,7 +48,7 @@ import logging
 import re
 from typing import Any
 
-import cloudscraper
+import requests
 
 from .const import (
     BASE_URL,
@@ -39,48 +60,418 @@ from .const import (
     DEBITE_INCARCA_ANAF_URL,
     IS_LOGGED_IN_URL,
     ANAF_INSTITUTION_ID,
+    DEFAULT_FLARESOLVERR_URL,
+    FLARESOLVERR_MAX_TIMEOUT,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 
+class FlareSolverrError(Exception):
+    """Raised when FlareSolverr fails to solve the challenge."""
+
+
+class CloudflareChallengeDetected(Exception):
+    """Raised when a response contains a Cloudflare challenge page."""
+
+
 class GhiseulRoAPI:
     """API client for the Ghiseul.ro platform.
 
-    Uses cloudscraper (a requests.Session subclass) to handle WAF
-    bot-protection challenges automatically.  All HTTP calls run in
-    a thread-pool executor so the HA event loop is never blocked.
+    Uses FlareSolverr to bypass Cloudflare Managed Challenge, then a
+    plain requests.Session with the extracted clearance cookies and
+    matching User-Agent for all subsequent HTTP calls.
+
+    All HTTP calls run in a thread-pool executor so the HA event loop
+    is never blocked.
     """
 
-    def __init__(self, username: str, password: str) -> None:
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        flaresolverr_url: str = DEFAULT_FLARESOLVERR_URL,
+    ) -> None:
         """Initialize the API client."""
         self._username = username
         self._password = password
-        self._scraper: cloudscraper.CloudScraper | None = None
+        self._flaresolverr_url = flaresolverr_url
+        self._session: requests.Session | None = None
+        self._authenticated = False
+        self._flaresolverr_session_id: str | None = None
+
+    # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
+
+    def _get_session(self) -> requests.Session:
+        """Get or create the requests session."""
+        if self._session is None:
+            self._session = requests.Session()
+        return self._session
+
+    def _reset_session(self) -> None:
+        """Close and discard the current requests session.
+
+        Called when clearance cookies expire and a fresh session is needed.
+        """
+        if self._session is not None:
+            self._session.close()
+            self._session = None
         self._authenticated = False
 
-    def _get_scraper(self) -> cloudscraper.CloudScraper:
-        """Get or create the cloudscraper session."""
-        if self._scraper is None:
-            _LOGGER.debug("Creating new cloudscraper session")
-            self._scraper = cloudscraper.create_scraper(
-                browser={
-                    "browser": "chrome",
-                    "platform": "windows",
-                    "desktop": True,
-                },
+    async def async_close(self) -> None:
+        """Close the underlying requests session and FlareSolverr session."""
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+        # Destroy FlareSolverr session if we created one
+        if self._flaresolverr_session_id is not None:
+            try:
+                await asyncio.to_thread(self._destroy_flaresolverr_session)
+            except Exception:
+                _LOGGER.debug(
+                    "Failed to destroy FlareSolverr session %s (non-critical)",
+                    self._flaresolverr_session_id,
+                )
+            self._flaresolverr_session_id = None
+
+    # ------------------------------------------------------------------
+    # Cloudflare challenge detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_cloudflare_challenge(response: requests.Response) -> bool:
+        """Detect whether a response is a Cloudflare challenge page.
+
+        Checks for:
+        - HTTP 403 with Cf-Mitigated header
+        - "Just a moment..." in the body (Cloudflare challenge title)
+        - Server: cloudflare header combined with 403
+        """
+        if response.status_code == 403:
+            # Definitive: Cloudflare mitigation header
+            if response.headers.get("Cf-Mitigated"):
+                return True
+            # Server header check
+            server = response.headers.get("Server", "").lower()
+            if "cloudflare" in server:
+                return True
+
+        # Body check - works for any status code (some challenges return 503)
+        body_lower = response.text[:2000].lower()
+        if "just a moment" in body_lower and (
+            "cloudflare" in body_lower
+            or response.headers.get("Server", "").lower() == "cloudflare"
+        ):
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Request wrapper with automatic clearance refresh
+    # ------------------------------------------------------------------
+
+    def _request_with_clearance(
+        self,
+        method: str,
+        url: str,
+        _is_retry: bool = False,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Make an HTTP request, automatically refreshing clearance on challenge.
+
+        If the response is a Cloudflare challenge page:
+        1. Re-solve the challenge via FlareSolverr
+        2. Re-authenticate with ghiseul.ro (old session is invalidated)
+        3. Retry the original request once
+
+        The _is_retry flag prevents infinite loops — at most one re-solve
+        per request.
+        """
+        session = self._get_session()
+        response = session.request(method, url, **kwargs)
+
+        if self._is_cloudflare_challenge(response):
+            if _is_retry:
+                _LOGGER.error(
+                    "Cloudflare challenge detected on retry for %s. "
+                    "Giving up — FlareSolverr clearance did not stick.",
+                    url,
+                )
+                raise CloudflareChallengeDetected(
+                    f"Cloudflare challenge on {url} even after re-solve"
+                )
+
+            _LOGGER.warning(
+                "Cloudflare challenge detected on %s (status=%s). "
+                "Clearance cookies likely expired. Re-solving...",
+                url,
+                response.status_code,
+            )
+
+            # Reset everything and re-establish clearance + auth
+            self._refresh_clearance_and_auth()
+
+            # Retry the original request
+            return self._request_with_clearance(
+                method, url, _is_retry=True, **kwargs
+            )
+
+        return response
+
+    def _refresh_clearance_and_auth(self) -> None:
+        """Re-solve Cloudflare challenge and re-authenticate.
+
+        Called when clearance cookies have expired mid-session.
+        Resets the requests session, obtains fresh clearance from
+        FlareSolverr, and logs back in to ghiseul.ro.
+        """
+        _LOGGER.info("Refreshing Cloudflare clearance and re-authenticating")
+
+        # Tear down old session (stale cookies)
+        self._reset_session()
+
+        # Phase 1: Solve Cloudflare challenge
+        cookies, user_agent = self._solve_cloudflare_challenge()
+
+        # Phase 2: Apply clearance to fresh session
+        self._apply_clearance_to_session(cookies, user_agent)
+
+        # Phase 3: Re-authenticate
+        session = self._get_session()
+
+        # Verify clearance works
+        response = session.get(f"{BASE_URL}/")
+        if self._is_cloudflare_challenge(response):
+            raise FlareSolverrError(
+                "Fresh clearance cookies from FlareSolverr did not "
+                "bypass Cloudflare after refresh."
+            )
+
+        # Login
+        login_data = {
+            "username": self._username,
+            "password": self._password,
+        }
+        headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"{BASE_URL}/",
+            "Origin": "https://www.ghiseul.ro",
+            "Accept": "text/html, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+
+        response = session.post(LOGIN_URL, data=login_data, headers=headers)
+        if response.status_code != 200:
+            raise Exception(
+                f"Re-login failed after clearance refresh: {response.status_code}"
+            )
+
+        # Verify login
+        response = session.post(
+            IS_LOGGED_IN_URL,
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        body = response.text.strip() if response.status_code == 200 else ""
+        if body != "1":
+            raise Exception(
+                f"Re-login verification failed after clearance refresh: "
+                f"este-logat returned '{body[:50]}'"
+            )
+
+        self._authenticated = True
+        _LOGGER.info(
+            "Clearance refresh complete — re-authenticated successfully"
+        )
+
+    # ------------------------------------------------------------------
+    # FlareSolverr interaction
+    # ------------------------------------------------------------------
+
+    def _call_flaresolverr(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Make a POST request to the FlareSolverr API.
+
+        Returns the parsed JSON response.
+        Raises FlareSolverrError on failure.
+        """
+        try:
+            _LOGGER.debug(
+                "FlareSolverr request: cmd=%s, url=%s",
+                payload.get("cmd"),
+                payload.get("url", "N/A"),
+            )
+            resp = requests.post(
+                self._flaresolverr_url,
+                json=payload,
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            _LOGGER.debug(
+                "FlareSolverr response: status=%s, message=%s",
+                data.get("status"),
+                data.get("message", ""),
+            )
+            if data.get("status") != "ok":
+                raise FlareSolverrError(
+                    f"FlareSolverr returned status '{data.get('status')}': "
+                    f"{data.get('message', 'unknown error')}"
+                )
+            return data
+        except requests.RequestException as err:
+            raise FlareSolverrError(
+                f"Failed to communicate with FlareSolverr at "
+                f"{self._flaresolverr_url}: {err}"
+            ) from err
+
+    def _create_flaresolverr_session(self) -> str:
+        """Create a persistent FlareSolverr session.
+
+        Returns the session ID.
+        """
+        data = self._call_flaresolverr({"cmd": "sessions.create"})
+        session_id = data.get("session")
+        if not session_id:
+            raise FlareSolverrError(
+                "FlareSolverr did not return a session ID"
+            )
+        _LOGGER.debug("Created FlareSolverr session: %s", session_id)
+        return session_id
+
+    def _destroy_flaresolverr_session(self) -> None:
+        """Destroy the FlareSolverr session."""
+        if self._flaresolverr_session_id:
+            try:
+                self._call_flaresolverr({
+                    "cmd": "sessions.destroy",
+                    "session": self._flaresolverr_session_id,
+                })
+                _LOGGER.debug(
+                    "Destroyed FlareSolverr session: %s",
+                    self._flaresolverr_session_id,
+                )
+            except FlareSolverrError:
+                pass
+
+    def _solve_cloudflare_challenge(self) -> tuple[list[dict], str]:
+        """Use FlareSolverr to solve the Cloudflare challenge on ghiseul.ro.
+
+        Returns:
+            Tuple of (cookies_list, user_agent_string)
+
+        The cookies list contains dicts with at minimum 'name' and 'value' keys.
+        """
+        # Create a persistent session so cookies are retained
+        if self._flaresolverr_session_id is None:
+            self._flaresolverr_session_id = self._create_flaresolverr_session()
+
+        _LOGGER.info(
+            "Solving Cloudflare challenge for %s via FlareSolverr", BASE_URL
+        )
+
+        data = self._call_flaresolverr({
+            "cmd": "request.get",
+            "url": f"{BASE_URL}/",
+            "session": self._flaresolverr_session_id,
+            "maxTimeout": FLARESOLVERR_MAX_TIMEOUT,
+        })
+
+        solution = data.get("solution", {})
+        status = solution.get("status", 0)
+        cookies = solution.get("cookies", [])
+        user_agent = solution.get("userAgent", "")
+        response_url = solution.get("url", "")
+
+        _LOGGER.debug(
+            "FlareSolverr challenge result: status=%s, url=%s, "
+            "cookies=%d, userAgent=%.60s...",
+            status,
+            response_url,
+            len(cookies),
+            user_agent,
+        )
+
+        if status == 403 or not cookies:
+            # FlareSolverr itself couldn't bypass the challenge
+            response_html = solution.get("response", "")
+            snippet = response_html[:500] if response_html else "(empty)"
+            raise FlareSolverrError(
+                f"FlareSolverr could not solve Cloudflare challenge "
+                f"(status={status}). Response snippet: {snippet}"
+            )
+
+        if not user_agent:
+            raise FlareSolverrError(
+                "FlareSolverr did not return a User-Agent string"
+            )
+
+        _LOGGER.info(
+            "Cloudflare challenge solved. Got %d cookies.", len(cookies)
+        )
+        return cookies, user_agent
+
+    def _apply_clearance_to_session(
+        self, cookies: list[dict], user_agent: str
+    ) -> None:
+        """Apply FlareSolverr clearance cookies and UA to requests.Session.
+
+        The User-Agent MUST match what FlareSolverr used, otherwise
+        Cloudflare will re-issue the challenge.
+        """
+        session = self._get_session()
+
+        # Set the matching User-Agent
+        session.headers.update({
+            "User-Agent": user_agent,
+        })
+        _LOGGER.debug("Set User-Agent: %.80s...", user_agent)
+
+        # Apply all cookies from FlareSolverr
+        for cookie in cookies:
+            name = cookie.get("name", "")
+            value = cookie.get("value", "")
+            domain = cookie.get("domain", "")
+            path = cookie.get("path", "/")
+
+            if not name or not value:
+                continue
+
+            # Clean domain - remove leading dot if present for setting
+            cookie_domain = domain.lstrip(".")
+
+            session.cookies.set(
+                name,
+                value,
+                domain=cookie_domain,
+                path=path,
             )
             _LOGGER.debug(
-                "Cloudscraper session created. User-Agent: %s",
-                self._scraper.headers.get("User-Agent", "N/A"),
+                "Applied cookie: %s=%s... (domain=%s, path=%s)",
+                name,
+                value[:20],
+                domain,
+                path,
             )
-        return self._scraper
 
-    async def async_close(self) -> None:
-        """Close the underlying requests session."""
-        if self._scraper is not None:
-            self._scraper.close()
-            self._scraper = None
+        _LOGGER.debug(
+            "Session cookies after applying clearance: %s",
+            list(session.cookies.keys()),
+        )
+
+    async def async_test_flaresolverr(self) -> bool:
+        """Test connectivity to FlareSolverr (for config flow validation).
+
+        Returns True if FlareSolverr is reachable and responding.
+        """
+        try:
+            data = await asyncio.to_thread(
+                self._call_flaresolverr, {"cmd": "sessions.list"}
+            )
+            return data.get("status") == "ok"
+        except FlareSolverrError as err:
+            _LOGGER.error("FlareSolverr connectivity test failed: %s", err)
+            return False
 
     # ------------------------------------------------------------------
     # Authentication
@@ -94,49 +485,54 @@ class GhiseulRoAPI:
         """Authenticate with the Ghiseul.ro platform.
 
         The authentication flow:
-        1. GET the base page first to obtain WAF clearance cookies
-        2. POST /login/process with username and password
-        3. Verify session by checking /index/este-logat
+        1. Use FlareSolverr to solve Cloudflare challenge and get cookies
+        2. Apply clearance cookies + User-Agent to requests session
+        3. POST /login/process with username and password
+        4. Verify session by checking /index/este-logat
         """
         try:
-            scraper = self._get_scraper()
-
-            # Step 0: Hit the base URL first to solve any WAF challenge
-            # and obtain clearance cookies before attempting login
+            # Phase 1: Solve Cloudflare challenge via FlareSolverr
             _LOGGER.debug(
-                "Step 0: Fetching base URL to solve WAF challenge: %s",
+                "Phase 1: Solving Cloudflare challenge via FlareSolverr"
+            )
+            cookies, user_agent = self._solve_cloudflare_challenge()
+
+            # Phase 2: Apply clearance to session and authenticate
+            _LOGGER.debug(
+                "Phase 2: Applying clearance cookies to requests session"
+            )
+            self._apply_clearance_to_session(cookies, user_agent)
+
+            session = self._get_session()
+
+            # Step 1: Hit the base URL through the session to verify
+            # clearance cookies work
+            _LOGGER.debug(
+                "Step 1: Verifying clearance by loading base URL: %s",
                 BASE_URL,
             )
-            response = scraper.get(f"{BASE_URL}/")
+            response = session.get(f"{BASE_URL}/")
             _LOGGER.debug(
-                "Step 0 result: status=%s, url=%s, body_length=%d",
+                "Step 1 result: status=%s, url=%s, body_length=%d",
                 response.status_code,
                 response.url,
                 len(response.text),
             )
-            _LOGGER.debug(
-                "Step 0 response headers: %s",
-                dict(response.headers),
-            )
-            _LOGGER.debug(
-                "Step 0 cookies after base page: %s",
-                {k: v for k, v in scraper.cookies.get_dict().items()},
-            )
-            # Check if WAF challenge page was returned instead of real content
-            if "security verification" in response.text.lower() or response.status_code == 403:
-                _LOGGER.warning(
-                    "Step 0: WAF challenge page detected (status=%s). "
-                    "Body snippet: %.500s",
+
+            if self._is_cloudflare_challenge(response):
+                _LOGGER.error(
+                    "Clearance cookies did not bypass Cloudflare. "
+                    "Status=%s, Headers: %s, Body snippet: %.300s",
                     response.status_code,
-                    response.text[:500],
-                )
-            else:
-                _LOGGER.debug(
-                    "Step 0: Base page loaded OK. Body snippet: %.300s",
+                    dict(response.headers),
                     response.text[:300],
                 )
+                raise FlareSolverrError(
+                    "Clearance cookies from FlareSolverr did not bypass "
+                    "Cloudflare. The challenge may have changed."
+                )
 
-            # Step 1: POST login
+            # Step 2: POST login
             login_data = {
                 "username": self._username,
                 "password": self._password,
@@ -150,25 +546,25 @@ class GhiseulRoAPI:
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             }
 
-            _LOGGER.debug("Step 1: Posting login to %s", LOGIN_URL)
-            response = scraper.post(
+            _LOGGER.debug("Step 2: Posting login to %s", LOGIN_URL)
+            response = session.post(
                 LOGIN_URL,
                 data=login_data,
                 headers=headers,
             )
             _LOGGER.debug(
-                "Step 1 result: status=%s, url=%s, body_length=%d",
+                "Step 2 result: status=%s, url=%s, body_length=%d",
                 response.status_code,
                 response.url,
                 len(response.text),
             )
             _LOGGER.debug(
-                "Step 1 response headers: %s",
+                "Step 2 response headers: %s",
                 dict(response.headers),
             )
             _LOGGER.debug(
-                "Step 1 cookies: %s",
-                {k: v for k, v in scraper.cookies.get_dict().items()},
+                "Step 2 cookies: %s",
+                list(session.cookies.keys()),
             )
 
             if response.status_code != 200:
@@ -182,17 +578,17 @@ class GhiseulRoAPI:
                 return False
 
             _LOGGER.debug(
-                "Step 1 login response body: %.300s", response.text[:300]
+                "Step 2 login response body: %.300s", response.text[:300]
             )
 
-            # Step 2: Verify we are logged in
-            _LOGGER.debug("Step 2: Verifying login via %s", IS_LOGGED_IN_URL)
-            response = scraper.post(
+            # Step 3: Verify we are logged in
+            _LOGGER.debug("Step 3: Verifying login via %s", IS_LOGGED_IN_URL)
+            response = session.post(
                 IS_LOGGED_IN_URL,
                 headers={"X-Requested-With": "XMLHttpRequest"},
             )
             _LOGGER.debug(
-                "Step 2 result: status=%s, body='%s'",
+                "Step 3 result: status=%s, body='%s'",
                 response.status_code,
                 response.text[:100].strip(),
             )
@@ -218,10 +614,7 @@ class GhiseulRoAPI:
                 )
                 return False
 
-        except cloudscraper.exceptions.CloudflareChallengeError as err:
-            _LOGGER.error(
-                "Cloudscraper failed to solve WAF challenge: %s", err
-            )
+        except FlareSolverrError:
             raise
         except Exception as err:
             _LOGGER.error(
@@ -308,6 +701,9 @@ class GhiseulRoAPI:
         First loads /debite/anaf to get the ANAF page context (CUI, tipPers),
         then calls /debite/incarca-debite-anaf which returns an HTML fragment
         with actual obligation data.
+
+        Uses _request_with_clearance() so expired Cloudflare cookies
+        are automatically refreshed.
         """
         result: dict[str, Any] = {
             "has_obligations": False,
@@ -318,10 +714,9 @@ class GhiseulRoAPI:
         }
 
         try:
-            scraper = self._get_scraper()
-
             # Step 1: Load ANAF page to establish context and extract CUI
-            response = scraper.get(
+            response = self._request_with_clearance(
+                "GET",
                 DEBITE_ANAF_URL,
                 headers={"Referer": DEBITE_URL},
             )
@@ -355,7 +750,8 @@ class GhiseulRoAPI:
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": DEBITE_ANAF_URL,
             }
-            response = scraper.get(
+            response = self._request_with_clearance(
+                "GET",
                 DEBITE_INCARCA_ANAF_URL,
                 headers=ajax_headers,
             )
@@ -534,19 +930,21 @@ class GhiseulRoAPI:
         Calls /debite/institutii to get the list of institutions,
         then /debite/get-institution-details/id_inst/{id} for each
         to get debt details.
+
+        Uses _request_with_clearance() so expired Cloudflare cookies
+        are automatically refreshed.
         """
         institutions: dict[str, dict[str, Any]] = {}
 
         try:
-            scraper = self._get_scraper()
-
             # Step 1: Get institution list
             ajax_headers = {
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": DEBITE_URL,
             }
 
-            response = scraper.get(
+            response = self._request_with_clearance(
+                "GET",
                 DEBITE_INSTITUTII_URL,
                 headers=ajax_headers,
             )
@@ -671,14 +1069,15 @@ class GhiseulRoAPI:
             "debts": [{"name": str, "amount": float}],
         }
         """
-        scraper = self._get_scraper()
         url = DEBITE_INSTITUTION_DETAILS_URL.format(id_inst=inst_id)
         ajax_headers = {
             "X-Requested-With": "XMLHttpRequest",
             "Referer": DEBITE_URL,
         }
 
-        response = scraper.get(url, headers=ajax_headers)
+        response = self._request_with_clearance(
+            "GET", url, headers=ajax_headers
+        )
         if response.status_code != 200:
             raise Exception(
                 f"Failed to fetch institution {inst_id}: {response.status_code}"

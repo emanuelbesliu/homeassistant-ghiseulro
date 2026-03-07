@@ -17,7 +17,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from .api import GhiseulRoAPI
-from .const import DOMAIN
+from .const import CONF_FLARESOLVERR_URL, DEFAULT_FLARESOLVERR_URL, DOMAIN
 from .coordinator import GhiseulRoDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -30,6 +30,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     api = GhiseulRoAPI(
         entry.data[CONF_USERNAME],
         entry.data[CONF_PASSWORD],
+        flaresolverr_url=entry.data.get(
+            CONF_FLARESOLVERR_URL, DEFAULT_FLARESOLVERR_URL
+        ),
     )
 
     try:
@@ -65,7 +68,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         data = hass.data[DOMAIN].pop(entry.entry_id)
-        # Close the dedicated aiohttp session
         api: GhiseulRoAPI = data["api"]
         await api.async_close()
 

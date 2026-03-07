@@ -22,3 +22,10 @@ ANAF_INSTITUTION_ID = "3627"
 
 # Update interval - 4 times per day (every 6 hours)
 DEFAULT_SCAN_INTERVAL = 21600  # 6 hours in seconds
+
+# FlareSolverr configuration
+CONF_FLARESOLVERR_URL = "flaresolverr_url"
+DEFAULT_FLARESOLVERR_URL = "http://homeassistant:8191/v1"
+
+# FlareSolverr timeout for solving Cloudflare challenges (ms)
+FLARESOLVERR_MAX_TIMEOUT = 60000
