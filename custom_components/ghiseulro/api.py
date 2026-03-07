@@ -44,7 +44,9 @@ executor via asyncio.to_thread() to avoid blocking the HA event loop.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import os
 import re
 from typing import Any
 
@@ -295,6 +297,9 @@ class GhiseulRoAPI:
 
         Returns the parsed JSON response.
         Raises FlareSolverrError on failure.
+
+        On non-200 responses, still attempts to parse JSON and save any
+        screenshot before raising, to aid in debugging.
         """
         try:
             _LOGGER.debug(
@@ -307,8 +312,23 @@ class GhiseulRoAPI:
                 json=payload,
                 timeout=180,
             )
-            resp.raise_for_status()
-            data = resp.json()
+
+            # Try to parse JSON even on error responses (FlareSolverr
+            # returns JSON bodies on 500 timeout errors too)
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+
+            # Save screenshot if present (works on both success and failure)
+            self._save_screenshot(data)
+
+            if resp.status_code != 200:
+                message = data.get("message", resp.text[:200])
+                raise FlareSolverrError(
+                    f"FlareSolverr HTTP {resp.status_code}: {message}"
+                )
+
             _LOGGER.debug(
                 "FlareSolverr response: status=%s, message=%s",
                 data.get("status"),
@@ -320,11 +340,51 @@ class GhiseulRoAPI:
                     f"{data.get('message', 'unknown error')}"
                 )
             return data
+        except FlareSolverrError:
+            raise
         except requests.RequestException as err:
             raise FlareSolverrError(
                 f"Failed to communicate with FlareSolverr at "
                 f"{self._flaresolverr_url}: {err}"
             ) from err
+
+    @staticmethod
+    def _save_screenshot(data: dict[str, Any]) -> None:
+        """Save a FlareSolverr screenshot to /config/ for debugging.
+
+        FlareSolverr returns the screenshot as a base64-encoded PNG string
+        in data["solution"]["screenshot"].  We decode and save to
+        /config/ghiseulro_debug_screenshot.png so the user can download
+        it from the HA file editor or SSH.
+        """
+        solution = data.get("solution", {})
+        screenshot_b64 = solution.get("screenshot")
+        if not screenshot_b64:
+            return
+
+        try:
+            # Strip data URL prefix if present
+            if "," in screenshot_b64:
+                screenshot_b64 = screenshot_b64.split(",", 1)[1]
+
+            png_data = base64.b64decode(screenshot_b64)
+            # /config is HA's config directory inside the container
+            screenshot_path = "/config/ghiseulro_debug_screenshot.png"
+            # Fallback if /config doesn't exist (e.g. dev environment)
+            if not os.path.isdir("/config"):
+                screenshot_path = "/tmp/ghiseulro_debug_screenshot.png"
+
+            with open(screenshot_path, "wb") as f:
+                f.write(png_data)
+            _LOGGER.info(
+                "FlareSolverr screenshot saved to %s (%d bytes)",
+                screenshot_path,
+                len(png_data),
+            )
+        except Exception as err:
+            _LOGGER.warning(
+                "Failed to save FlareSolverr screenshot: %s", err
+            )
 
     def _create_flaresolverr_session(self) -> str:
         """Create a persistent FlareSolverr session.
@@ -377,6 +437,7 @@ class GhiseulRoAPI:
             "session": self._flaresolverr_session_id,
             "maxTimeout": FLARESOLVERR_MAX_TIMEOUT,
             "tabs_till_verify": FLARESOLVERR_TABS_TILL_VERIFY,
+            "returnScreenshot": True,
         })
 
         solution = data.get("solution", {})
