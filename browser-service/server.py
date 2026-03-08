@@ -434,7 +434,14 @@ async def handle_login(request: web.Request) -> web.Response:
         logged_in = is_logged.strip() == "1"
         logger.info(f"Logged in: {logged_in}")
 
-        # Keep the tab open for subsequent requests
+        # Keep the tab open only if login succeeded; close it otherwise
+        # to prevent tab accumulation on repeated failed attempts.
+        if not logged_in:
+            try:
+                await tab.close()
+            except Exception:
+                pass
+
         return web.json_response({
             "status": "ok",
             "logged_in": logged_in,
@@ -682,6 +689,7 @@ async def handle_scrape_all(request: web.Request) -> web.Response:
             )
 
         login_js = _build_login_js(username, password)
+        tab: Optional[nd.Tab] = None
 
         # Step 1: Navigate to login page, solve CF
         logger.info("=== Starting full scrape ===")
@@ -709,6 +717,11 @@ async def handle_scrape_all(request: web.Request) -> web.Response:
         # Check login
         is_logged = await ajax_post(tab, ESTE_LOGAT_URL, {})
         if is_logged.strip() != "1":
+            # Close tab on failed login to prevent leak
+            try:
+                await tab.close()
+            except Exception:
+                pass
             return web.json_response({
                 "status": "error",
                 "message": "Login failed",
@@ -784,6 +797,15 @@ async def handle_scrape_all(request: web.Request) -> web.Response:
         except Exception:
             pass
 
+        # Step 7: Close the tab to prevent tab accumulation / memory leak.
+        # Each navigate_and_solve() opens a new tab; without closing it,
+        # tabs pile up over repeated 6-hour refresh cycles.
+        logger.info("Step 7: Closing scrape tab...")
+        try:
+            await tab.close()
+        except Exception as e:
+            logger.debug(f"Tab close failed (non-critical): {e}")
+
         logger.info("=== Full scrape complete ===")
         return web.json_response({
             "status": "ok",
@@ -797,6 +819,11 @@ async def handle_scrape_all(request: web.Request) -> web.Response:
 
     except Exception as e:
         logger.error(f"Scrape-all error: {e}", exc_info=True)
+        # Close tab if it was created, to prevent leak on error paths
+        try:
+            await tab.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
         return web.json_response(
             {"status": "error", "message": str(e)}, status=500
         )
