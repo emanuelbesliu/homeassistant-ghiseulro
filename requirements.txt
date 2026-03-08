@@ -1,5 +1,2 @@
 # Ghiseul.ro Home Assistant Integration Dependencies
-# These dependencies must be kept in sync with manifest.json
-
-# HTTP client (used with Cloudflare clearance cookies from FlareSolverr)
-requests>=2.31.0
+# aiohttp is built into Home Assistant - no additional dependencies needed

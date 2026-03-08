@@ -27,7 +27,7 @@ from homeassistant.helpers.update_coordinator import (
     UpdateFailed,
 )
 
-from .api import CloudflareChallengeDetected, FlareSolverrError, GhiseulRoAPI
+from .api import AuthenticationError, BrowserServiceError, GhiseulRoAPI
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -95,8 +95,6 @@ class GhiseulRoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "have changed. Integration will require reconfiguration: %s",
                     err,
                 )
-                # Clear auth state so a future reauth starts fresh
-                self.api._authenticated = False
                 raise ConfigEntryAuthFailed(
                     "Authentication failed. Please reconfigure the integration "
                     "with valid credentials."
@@ -156,25 +154,16 @@ class GhiseulRoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _is_auth_error(err: Exception) -> bool:
         """Determine whether an exception indicates an authentication problem.
 
-        Checks for:
-        - HTTP 401 / 403 status codes in requests.HTTPError
-        - Explicit "login" / "authentication" phrases
-        - NOT FlareSolverr or Cloudflare errors (those are transient, not auth)
-
-        FlareSolverrError and CloudflareChallengeDetected are infrastructure
-        issues (FlareSolverr down, challenge unsolvable), not credential
-        failures, so they are treated as transient errors and retried.
+        AuthenticationError from the API means bad credentials or locked out.
+        BrowserServiceError means the microservice is down — that's transient.
         """
-        import requests as req_lib
+        # Explicit authentication failure from the API
+        if isinstance(err, AuthenticationError):
+            return True
 
-        # FlareSolverr / Cloudflare issues are NOT auth errors
-        if isinstance(err, (FlareSolverrError, CloudflareChallengeDetected)):
+        # Browser service issues are NOT auth errors — they are transient
+        if isinstance(err, BrowserServiceError):
             return False
-
-        # requests gives us HTTPError with a response
-        if isinstance(err, req_lib.HTTPError) and err.response is not None:
-            if err.response.status_code in (401, 403):
-                return True
 
         # Fall back to inspecting the string representation
         err_str = str(err).lower()
@@ -184,6 +173,5 @@ class GhiseulRoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "invalid credentials",
             "login failed",
             "autentificare",
-            "este-logat returned '0'",
         )
         return any(kw in err_str for kw in auth_keywords)

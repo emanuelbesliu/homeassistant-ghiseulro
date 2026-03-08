@@ -3,11 +3,11 @@
     "step": {
       "user": {
         "title": "Configurează Ghiseul.ro",
-        "description": "Introdu datele de autentificare pentru contul tău Ghiseul.ro.\n\nAceastă integrare necesită add-on-ul FlareSolverr instalat și pornit pentru a ocoli protecția Cloudflare de pe ghiseul.ro.",
+        "description": "Introdu datele de autentificare pentru contul tău Ghiseul.ro.\n\nAceastă integrare necesită microserviciul ghiseul-browser pornit și accesibil.",
         "data": {
           "username": "Nume utilizator",
           "password": "Parolă",
-          "flaresolverr_url": "URL FlareSolverr"
+          "browser_service_url": "URL Serviciu Browser"
         }
       },
       "reauth_confirm": {
@@ -21,7 +21,7 @@
     "error": {
       "cannot_connect": "Nu s-a putut conecta la Ghiseul.ro",
       "invalid_auth": "Date de autentificare invalide",
-      "flaresolverr_unavailable": "FlareSolverr nu este accesibil. Asigură-te că add-on-ul FlareSolverr este instalat și pornit.",
+      "browser_service_unavailable": "Serviciul browser nu este accesibil. Asigură-te că ghiseul-browser este pornit și accesibil.",
       "unknown": "Eroare neașteptată"
     },
     "abort": {
