@@ -1,0 +1,46 @@
+---
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          release-type: python
+          package-name: ghiseulro
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout (on release)
+        if: steps.release.outputs.release_created
+        uses: actions/checkout@v4
+
+      - name: Create release zip (on release)
+        if: steps.release.outputs.release_created
+        run: |
+          cd custom_components/ghiseulro
+          zip -r "../../ghiseulro-${{ steps.release.outputs.tag_name }}.zip" \
+            *.py manifest.json strings.json \
+            translations/
+          cd ../..
+
+      - name: Upload release asset
+        if: steps.release.outputs.release_created
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.release.outputs.tag_name }}" \
+            "ghiseulro-${{ steps.release.outputs.tag_name }}.zip"
