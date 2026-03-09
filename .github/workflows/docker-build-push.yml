@@ -59,7 +59,7 @@ jobs:
 
       - name: Build and push
         id: build-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: browser-service
           platforms: linux/amd64,linux/arm64
