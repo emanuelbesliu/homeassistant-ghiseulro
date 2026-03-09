@@ -20,6 +20,7 @@ permissions:
   contents: read
   packages: write
   id-token: write  # For cosign keyless signing via OIDC
+  security-events: write  # For Trivy SARIF upload
 
 jobs:
   build:
@@ -92,7 +93,7 @@ jobs:
           severity: "CRITICAL,HIGH"
 
       - name: Upload Trivy scan results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-results.sarif') != ''
         with:
           sarif_file: "trivy-results.sarif"
