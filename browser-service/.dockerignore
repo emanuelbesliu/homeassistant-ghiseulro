@@ -1,0 +1,35 @@
+# Version control
+.git
+.gitignore
+
+# Documentation
+*.md
+README*
+LICENSE
+
+# IDE / editor
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+
+# CI/CD
+.github
+
+# Infrastructure (k8s manifests)
+../infra
+
+# Home Assistant integration (not needed in browser service image)
+../custom_components
+../hacs.json
+../.gitignore
