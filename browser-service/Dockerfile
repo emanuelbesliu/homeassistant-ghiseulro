@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 # OCI image labels (build-time args populated by CI)
 ARG BUILD_DATE
