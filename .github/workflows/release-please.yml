@@ -26,7 +26,7 @@ jobs:
 
       - name: Checkout (on release)
         if: steps.release.outputs.release_created
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Create release zip (on release)
         if: steps.release.outputs.release_created
