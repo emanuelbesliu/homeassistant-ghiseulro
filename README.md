@@ -82,6 +82,12 @@ All monetary sensors include detailed breakdowns in their attributes.
 
 Data is refreshed every **6 hours** (4 times per day). On failure, the integration retries with exponential backoff (5min, 10min, 20min, 40min cap).
 
+## ☕ Support the Developer
+
+If you find this project useful, consider buying me a coffee!
+
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/emanuelbesliu)
+
 ## License
 
 MIT License — Copyright (c) 2026 Emanuel Besliu
