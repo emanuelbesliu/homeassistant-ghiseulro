@@ -1,5 +1,7 @@
 # Ghiseul.ro for Home Assistant
 
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/emanuelbesliu)
+
 Custom Home Assistant integration for [Ghiseul.ro](https://www.ghiseul.ro/) — the Romanian government's online payment portal. Monitor your pending debts, ANAF tax obligations, and local institution payments directly from your Home Assistant dashboard.
 
 > **Disclaimer:** This integration is developed independently through reverse engineering for personal use. It is **not affiliated with, endorsed by, or supported by** Ghiseul.ro, SNEP, or the Romanian Government.
