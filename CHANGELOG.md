@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.0](https://github.com/emanuelbesliu/homeassistant-ghiseulro/compare/v2.0.1...v2.1.0) (2026-03-19)
+
+
+### Features
+
+* add brand icon for HA integrations page ([25e6e3c](https://github.com/emanuelbesliu/homeassistant-ghiseulro/commit/25e6e3c328cc59ff83c2146c56ffa8a2928b2ca4))
+
 ## [2.0.1](https://github.com/emanuelbesliu/homeassistant-ghiseulro/compare/v2.0.0...v2.0.1) (2026-03-16)
 
 
