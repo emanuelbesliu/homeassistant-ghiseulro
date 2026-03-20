@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.0](https://github.com/emanuelbesliu/homeassistant-ghiseulro/compare/v2.1.0...v2.2.0) (2026-03-20)
+
+
+### Features
+
+* replace brand icon with official Ghiseul.ro logo ([7fabbf0](https://github.com/emanuelbesliu/homeassistant-ghiseulro/commit/7fabbf0f9e6f8fb64930145696711c037c641750))
+
 ## [2.1.0](https://github.com/emanuelbesliu/homeassistant-ghiseulro/compare/v2.0.1...v2.1.0) (2026-03-19)
 
 
