@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.2.1](https://github.com/emanuelbesliu/homeassistant-ghiseulro/compare/v2.2.0...v2.2.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* **browser-service:** pin Python 3.11 + nodriver 0.48.1 (3.14 build broken) ([274b57d](https://github.com/emanuelbesliu/homeassistant-ghiseulro/commit/274b57d2c9f8fa1395172c1a45aea13a132ddd3b))
+* **browser-service:** reap zombie Chrome processes and stop temp-dir leak ([b9e6245](https://github.com/emanuelbesliu/homeassistant-ghiseulro/commit/b9e62456dce3a67ae9d496449ce7a80917462919))
+
 ## [2.2.0](https://github.com/emanuelbesliu/homeassistant-ghiseulro/compare/v2.1.0...v2.2.0) (2026-03-20)
 
 
