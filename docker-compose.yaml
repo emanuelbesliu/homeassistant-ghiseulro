@@ -1,0 +1,31 @@
+services:
+  ghiseul-browser:
+    build:
+      context: ./browser-service
+    image: ghiseul-browser:cf-recovery-local
+    container_name: ghiseul-browser
+    restart: unless-stopped
+    ports:
+      - "8192:8192"
+      - "6080:6080"
+    shm_size: "512mb"
+    environment:
+      TZ: Europe/Bucharest
+      HEADLESS: "true"
+      LOG_LEVEL: INFO
+      USER_DATA_DIR: /data/chrome
+      CF_SOLVE_TIMEOUT: "90"
+      CF_RETRY_COOLDOWN: "300"
+      ENABLE_VNC: "true"
+      VNC_PASSWORD: "Martian1"
+    volumes:
+      - ghiseul-browser-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8192/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  ghiseul-browser-data:

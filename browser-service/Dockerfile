@@ -22,6 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-sandbox \
     xvfb \
+    x11vnc \
+    novnc \
+    websockify \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -40,24 +43,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-# Pin to the proven-working runtime (matches image v0.1.9): newer nodriver
-# releases ship a source file that is invalid under Python 3.14 and some are
-# incompatible, so keep Python 3.11 and pin the dependency versions.
+# Keep the working browser API; display-based verification does not depend on
+# an iframe being exposed by nodriver. Pin the image recognition/input runtime.
 RUN pip install --no-cache-dir \
     aiohttp==3.13.3 \
     nodriver==0.48.1 \
-    xvfbwrapper
+    xvfbwrapper==0.2.34 \
+    mss==10.2.0 \
+    opencv-python-headless==5.0.0.93 \
+    python-xlib==0.33
 
 WORKDIR /app
-COPY server.py .
+COPY server.py native_verify.py ./
 
 # Environment
 ENV HEADLESS=true
 ENV HOST=0.0.0.0
 ENV PORT=8192
 ENV LOG_LEVEL=INFO
+ENV USER_DATA_DIR=/data/chrome
+ENV CF_SOLVE_TIMEOUT=90
+ENV CF_RETRY_COOLDOWN=300
+ENV CF_NATIVE_CLICK=true
 
-EXPOSE 8192
+EXPOSE 8192 6080
 
 # tini reaps zombie Chrome subprocesses (-g forwards signals to the process group)
 ENTRYPOINT ["/usr/bin/tini", "-g", "--"]

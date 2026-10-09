@@ -13,6 +13,7 @@ Implements a resilient polling controller that:
 - Retries with exponential backoff on failure (5m, 10m, 20m, 40m cap)
 - Detects authentication failures and triggers a reauth flow instead of retrying
 """
+
 from __future__ import annotations
 
 import logging
@@ -103,6 +104,8 @@ class GhiseulRoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Transient / network error - schedule a retry
             self._retry_count += 1
             next_retry = self._next_retry_interval()
+            if isinstance(err, BrowserServiceError) and err.retry_after:
+                next_retry = max(next_retry, timedelta(seconds=err.retry_after))
             self.update_interval = next_retry
 
             _LOGGER.warning(
@@ -119,9 +122,7 @@ class GhiseulRoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # No cache yet (first fetch ever failed) - propagate so HA
             # knows the integration is not ready
-            raise UpdateFailed(
-                f"Error communicating with Ghiseul.ro: {err}"
-            ) from err
+            raise UpdateFailed(f"Error communicating with Ghiseul.ro: {err}") from err
 
     # ------------------------------------------------------------------
     # Retry helpers

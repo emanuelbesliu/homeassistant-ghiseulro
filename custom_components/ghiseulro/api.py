@@ -19,6 +19,7 @@ Architecture:
     2. Parses the HTML fragments in the response into structured data
     3. Returns the data dict expected by the coordinator / sensors
 """
+
 from __future__ import annotations
 
 import logging
@@ -29,8 +30,8 @@ import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
-# Timeout for the /scrape-all call (CF solve ~25s + data scrape ~10s)
-SCRAPE_TIMEOUT = aiohttp.ClientTimeout(total=120)
+# Cover the browser's configurable verification wait (up to 180s) plus scraping.
+SCRAPE_TIMEOUT = aiohttp.ClientTimeout(total=300)
 
 
 class GhiseulRoAPIError(Exception):
@@ -43,6 +44,10 @@ class AuthenticationError(GhiseulRoAPIError):
 
 class BrowserServiceError(GhiseulRoAPIError):
     """Browser microservice is unreachable or returned an error."""
+
+    def __init__(self, message: str, retry_after: int = 0) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class GhiseulRoAPI:
@@ -154,9 +159,16 @@ class GhiseulRoAPI:
                 if resp.status != 200 or body.get("status") != "ok":
                     error_msg = body.get("message", f"HTTP {resp.status}")
                     raise BrowserServiceError(
-                        f"Browser service error: {error_msg}"
+                        f"Browser service error: {error_msg}",
+                        retry_after=self._retry_after(
+                            body.get("retry_after", resp.headers.get("Retry-After"))
+                        ),
                     )
 
+        except TimeoutError as err:
+            raise BrowserServiceError(
+                "Browser service did not finish within 300 seconds"
+            ) from err
         except aiohttp.ClientError as err:
             raise BrowserServiceError(
                 f"Cannot reach browser service at "
@@ -166,6 +178,14 @@ class GhiseulRoAPI:
         # Parse the raw HTML responses into structured data
         return self._parse_scrape_response(body)
 
+    @staticmethod
+    def _retry_after(value: Any) -> int:
+        """Accept a bounded retry hint from the companion service."""
+        try:
+            return max(0, min(2400, int(value)))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
     # ------------------------------------------------------------------
     # HTML parsing
     # ------------------------------------------------------------------
@@ -173,9 +193,7 @@ class GhiseulRoAPI:
     def _parse_scrape_response(self, body: dict[str, Any]) -> dict[str, Any]:
         """Parse the /scrape-all response into sensor-friendly data."""
         # Parse institutions
-        institutions = self._parse_institutions(
-            body.get("institutions", [])
-        )
+        institutions = self._parse_institutions(body.get("institutions", []))
 
         # Parse ANAF
         anaf = self._parse_anaf(
@@ -234,9 +252,7 @@ class GhiseulRoAPI:
 
         return result
 
-    def _parse_institution_debts(
-        self, html: str
-    ) -> list[dict[str, Any]]:
+    def _parse_institution_debts(self, html: str) -> list[dict[str, Any]]:
         """Parse individual debt rows from an institution details HTML."""
         debts: list[dict[str, Any]] = []
         if not html:
@@ -245,9 +261,9 @@ class GhiseulRoAPI:
         # Look for debt rows: each has a description and an amount input
         # Pattern: <td>Debt Name</td> ... <input ... value="amount" ...>
         row_pattern = re.compile(
-            r'<tr[^>]*>\s*'
-            r'<td[^>]*>.*?</td>\s*'  # checkbox or empty td
-            r'<td[^>]*>(.*?)</td>\s*'  # debt name
+            r"<tr[^>]*>\s*"
+            r"<td[^>]*>.*?</td>\s*"  # checkbox or empty td
+            r"<td[^>]*>(.*?)</td>\s*"  # debt name
             r'<td[^>]*>.*?value="([^"]*)"',  # amount input
             re.DOTALL | re.IGNORECASE,
         )
@@ -267,9 +283,7 @@ class GhiseulRoAPI:
 
         return debts
 
-    def _parse_anaf(
-        self, page_html: str, debts_html: str
-    ) -> dict[str, Any]:
+    def _parse_anaf(self, page_html: str, debts_html: str) -> dict[str, Any]:
         """Parse ANAF data from the page HTML and debts fragment."""
         result: dict[str, Any] = {
             "total": 0.0,
@@ -281,9 +295,7 @@ class GhiseulRoAPI:
 
         # Extract CUI from the ANAF page (hidden input or profile header)
         if page_html:
-            cui_match = re.search(
-                r'name="cui_plata"\s+value="([^"]*)"', page_html
-            )
+            cui_match = re.search(r'name="cui_plata"\s+value="([^"]*)"', page_html)
             if cui_match:
                 result["cui"] = cui_match.group(1)
 
@@ -305,9 +317,9 @@ class GhiseulRoAPI:
         # Parse individual ANAF obligations
         # ANAF debts have rows with: type name, amount, details
         obligation_pattern = re.compile(
-            r'<tr[^>]*>\s*'
-            r'<td[^>]*>.*?</td>\s*'  # checkbox
-            r'<td[^>]*>(.*?)</td>\s*'  # obligation name
+            r"<tr[^>]*>\s*"
+            r"<td[^>]*>.*?</td>\s*"  # checkbox
+            r"<td[^>]*>(.*?)</td>\s*"  # obligation name
             r'<td[^>]*>.*?value="([^"]*)"',  # amount
             re.DOTALL | re.IGNORECASE,
         )
@@ -327,9 +339,7 @@ class GhiseulRoAPI:
                 total += amount
 
         # Also check for TotalGeneral input
-        total_match = re.search(
-            r'id="TotalGeneral"\s+value="([^"]*)"', debts_html
-        )
+        total_match = re.search(r'id="TotalGeneral"\s+value="([^"]*)"', debts_html)
         if total_match:
             total = self._parse_romanian_amount(total_match.group(1))
 
@@ -337,16 +347,12 @@ class GhiseulRoAPI:
         result["has_obligations"] = total > 0.0
 
         if result["has_obligations"]:
-            result["message"] = (
-                f"Obligații fiscale ANAF: {total:.2f} RON"
-            )
+            result["message"] = f"Obligații fiscale ANAF: {total:.2f} RON"
         else:
             result["message"] = "Nu există obligații de plată"
 
         # Check for somate (enforced) subtotal
-        somate_match = re.search(
-            r'id="subtotal"\s+value="([^"]*)"', debts_html
-        )
+        somate_match = re.search(r'id="subtotal"\s+value="([^"]*)"', debts_html)
         if somate_match:
             somate_total = self._parse_romanian_amount(somate_match.group(1))
             if somate_total > 0:
