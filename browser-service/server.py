@@ -20,6 +20,7 @@ import tempfile
 import time
 from typing import Optional
 
+import aiohttp
 import nodriver as nd
 from aiohttp import web
 
@@ -53,6 +54,10 @@ ACCESS_DENIED_TITLES = ["Access denied", "Attention Required! | Cloudflare"]
 
 SHORT_TIMEOUT = 3
 CF_SOLVE_TIMEOUT = 60
+# Optional FlareSolverr fallback: when the built-in solver times out, fetch
+# cf_clearance + User-Agent from FlareSolverr (same egress IP) and inject them.
+FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "")
+FLARESOLVERR_TIMEOUT_MS = 90000
 
 logger = logging.getLogger("ghiseul-browser")
 
@@ -267,8 +272,39 @@ async def navigate_and_solve(url: str) -> nd.Tab:
     """Navigate to URL, solve CF challenge if present, return the tab."""
     drv = await get_browser()
     tab = await drv.get(url)
-    await solve_cf_challenge(tab)
+    try:
+        await solve_cf_challenge(tab)
+    except TimeoutError:
+        if not FLARESOLVERR_URL:
+            raise
+        logger.warning("Built-in CF solver timed out, falling back to FlareSolverr")
+        await apply_flaresolverr_clearance(tab, url)
+        tab = await drv.get(url)
+        await solve_cf_challenge(tab, timeout=15)
     return tab
+
+
+async def apply_flaresolverr_clearance(tab: nd.Tab, url: str) -> None:
+    """Solve the challenge via FlareSolverr and inject its cookies and UA into the tab."""
+    payload = {"cmd": "request.get", "url": url, "maxTimeout": FLARESOLVERR_TIMEOUT_MS}
+    timeout = aiohttp.ClientTimeout(total=FLARESOLVERR_TIMEOUT_MS / 1000 + 15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(FLARESOLVERR_URL, json=payload) as resp:
+            data = await resp.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(f"FlareSolverr failed: {data.get('message')}")
+    solution = data["solution"]
+    await tab.send(nd.cdp.network.set_user_agent_override(user_agent=solution["userAgent"]))
+    for c in solution.get("cookies", []):
+        await tab.send(nd.cdp.network.set_cookie(
+            name=c["name"],
+            value=c["value"],
+            domain=c.get("domain"),
+            path=c.get("path", "/"),
+            secure=c.get("secure", False),
+            http_only=c.get("httpOnly", False),
+        ))
+    logger.info("Applied %d FlareSolverr cookies and user agent", len(solution.get("cookies", [])))
 
 
 def _safe_evaluate_result(result) -> str:
